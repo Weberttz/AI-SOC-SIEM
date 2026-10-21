@@ -63,16 +63,46 @@ df['day_of_week'] = df['timestamp'].dt.dayofweek
 # Removemos a coluna original de timestamp pois ela não vai para o vetor final
 df = df.drop(columns=['timestamp'])
 
+""" Remover
+* signature e signature_id (vão gerar colunas infinitas no dummy)
+* user e senha (são textos muito aleatórios de força bruta)
+* payload (comandos e URLs mto longos q talvez quebrem o modelo por n conseguir processar)
+* session_id (é só um id único, pode confundir a ia)
+* agent_name e src_log (se n for o msm q o source_tool, acho q tbm dá pra largar, já q é só o nome do agente e o caminho do log tbm acho q n muda o comportamento do ataque)
+* extra (acho q é só o json bruto, n deve dar pra ler direito)"""
+
+# Passando todas as colunas de uma vez só e salvando de volta no df
+df = df.drop(columns=[
+    'signature', 'signature_id', 'username', 'password', 'category',
+    'payload', 'session_id', 'src_log', 'agent_name', 'extra'
+], errors='ignore') # errors='ignore' evita que o código quebre caso alguma coluna já não exista
+
 # --- PASSO 3: Tratamento de Variáveis Categóricas (One-Hot Encoding) ---
 # Isso vai transformar a coluna 'proto' em 'proto_TCP' e 'proto_UDP' com valores 0 ou 1
 # E fará o mesmo com a coluna 'source_tool'
 df_encoded = pd.get_dummies(df, columns=['proto', 'source_tool', 'app_proto'], dtype=int)
 
+CAMPOS = [
+    'severity_orig', 'pkts_to_server', 'pkts_to_client', 
+    'bytes_to_server', 'bytes_to_client', 'duration_s'
+]
+
 # --- PASSO 4: Normalização de Valores Numéricos (Colocar entre 0 e 1) ---
 scaler = MinMaxScaler()
+mapa_severidade = {'info': 0, 'low': 1, 'high': 2, 'critical': 3}
+
+# coloca como 0 os nulls
+df_encoded['severity'] = df_encoded['severity'].fillna('info')
+
+for campo in CAMPOS:
+    df_encoded[campo] = df_encoded[campo].fillna(0)
+
+# transforma em numero
+df_encoded['severity'] = df_encoded['severity'].map(mapa_severidade)
+
 # Vamos normalizar a porta de destino e a severidade para a mesma escala
-df_encoded[['src_port','dst_port','hour','day_of_week']] = scaler.fit_transform(
-    df_encoded[['src_port','dst_port','hour', 'day_of_week']]
+df_encoded[['src_port','dst_port','hour','day_of_week', 'severity']] = scaler.fit_transform(
+    df_encoded[['src_port','dst_port','hour', 'day_of_week', 'severity']]
 )
 
 # --- PASSO 5: Gerando os Vetores de Características ---

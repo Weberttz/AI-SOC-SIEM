@@ -127,9 +127,9 @@ def severidade_wazuh(valor):             # rule.level 0-16
     if nivel_regra is None:
         return None
     if nivel_regra <= 3:
-        return "low"
+        return "info"
     if nivel_regra <= 7:
-        return "medium"
+        return "low"
     if nivel_regra <= 11:
         return "high"
     return "critical"
