@@ -1,7 +1,9 @@
 import json
 from collections import Counter
+from pathlib import Path
 
-arquivo = "unificado.jsonl"
+raiz_do_projeto = Path(__file__).resolve().parent.parent
+arquivo = raiz_do_projeto / "Logs_unificados/unificado.jsonl"
 
 total = 0
 fontes = Counter()

@@ -10,9 +10,9 @@ import json
 from sklearn.preprocessing import MinMaxScaler
 from pathlib import Path
 
-# Defina a pasta de destino e o nome do arquivo
-caminho_destino = Path("./Dados/dados.json")
-nome_arquivo = "unificado.jsonl"
+raiz_do_projeto = Path(__file__).resolve().parent.parent
+caminho_destino = raiz_do_projeto / "Dados" / "dados.json"
+caminho_arquivo = raiz_do_projeto / "Logs_unificados/unificado.jsonl"
 eventos = []
 
 """ESQUEMA = [
@@ -38,7 +38,7 @@ eventos = []
     "extra",            # JSON com campos específicos da ferramenta
 ]"""
 
-with open(nome_arquivo) as arquivo:
+with open(caminho_arquivo) as arquivo:
     for linha in arquivo:
            if not linha.strip():
                continue
