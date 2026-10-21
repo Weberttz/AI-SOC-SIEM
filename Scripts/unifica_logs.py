@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 OPCOES = {"cowrie_full": False, "dionaea_tz": "+00:00"}
 
 
-# ---------------------------------------------------------------- esquema ----
+# --- esquema ----
 ESQUEMA = [
     "timestamp",        # UTC, ISO8601
     "source_tool",      # suricata | zeek | wazuh | cowrie | dionaea | heralding
