@@ -116,14 +116,17 @@ def norm_ts(v):
 
 
 def norm_proto(v):
+    """Normaliza nome de protocolo"""
     return str(v).lower() if v not in (None, "") else None
 
 
 def sev_suricata(v):          # 1 = alto ... 3 = baixo (conforme catálogo)
+    """Descreve severidade baseado no catálogo dos dados (Planilha)"""
     return {1: "high", 2: "medium", 3: "low"}.get(to_int(v), None)
 
 
 def sev_wazuh(v):             # rule.level 0-16
+    """"Descreve severidade do Wazuh"""
     n = to_int(v)
     if n is None:
         return None
@@ -144,6 +147,7 @@ def new_record(tool, src_log):
 
 
 def finish(r, extra):
+    """Se quiser adicionar dados extras, do dionaea por exemplo"""
     r["extra"] = json.dumps(extra, ensure_ascii=False, default=str) if extra else None
     return r
 
@@ -160,6 +164,7 @@ def open_text(path):
 
 
 def iter_jsonl(path):
+    """"Ler em jsonl"""
     with open_text(path) as fh:
         for n, line in enumerate(fh, 1):
             line = line.strip()
@@ -171,7 +176,7 @@ def iter_jsonl(path):
                 print(f"[aviso] {path}:{n} linha JSON inválida, ignorada", file=sys.stderr)
 
 
-# ----------------------------------------------------------------- parsers ----
+# ---- parsers ----
 def parse_suricata(path):
     for ev in iter_jsonl(path):
         r = new_record("suricata", path)
@@ -552,8 +557,9 @@ PARSERS = {
 }
 
 
-# --------------------------------------------------------------------- saída --
+# --- saída ---
 def expand(patterns):
+    """Ler todos os logs da ferramenta indicada. Aceita arquivos, globs (logs/*.json) e diretórios"""
     files = []
     for p in patterns:
         hits = sorted(glob.glob(p))
@@ -564,6 +570,7 @@ def expand(patterns):
 
 
 def collect(args):
+    """Percorre cada ferramenta e chama o parser certo"""
     for tool, parser in PARSERS.items():
         for path in expand(getattr(args, tool) or []):
             n = 0
