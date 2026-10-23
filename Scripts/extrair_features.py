@@ -6,6 +6,7 @@
 """
 
 import pandas as pd
+import numpy as np
 import json 
 import argparse
 import ipaddress
@@ -25,12 +26,17 @@ CAMPOS_ESCALONADOS = [
     "bytes_to_server", "bytes_to_client", "duration_s",
 ]
 
+CAMPOS_AUSENCIA = [
+    f"{campo}_missing"
+    for campo in CAMPOS_ESCALONADOS
+]
+
 CAMPOS_NUMERICOS = [
-    "severity", "src_port", "dst_port", *CAMPOS_ESCALONADOS,
+    "severity", "src_port", "dst_port", 
+    *CAMPOS_ESCALONADOS, *CAMPOS_AUSENCIA,
     "hour", "day_of_week", "is_weekend", "is_src_private",
     "is_dst_private", "src_ip_blocked",
 ]
-
 
 def ler_entrada(caminho_arquivo):
     """Lê o CSV gerado por unifica_logs.py ou um JSONL compatível."""
@@ -82,8 +88,44 @@ def preparar_dados(df):
     )
     for campo in CAMPOS_CATEGORICOS:
         df[campo] = df[campo].fillna("(ausente)").astype(str)
+    # 1. Converte os campos numéricos originais
     for campo in CAMPOS_NUMERICOS:
-        df[campo] = pd.to_numeric(df[campo], errors="coerce").fillna(0)
+        if campo not in CAMPOS_AUSENCIA:
+            df[campo] = pd.to_numeric(
+                df[campo],
+                errors="coerce"
+            )
+
+    # 2. Trata os campos que serão escalonados
+    for campo in CAMPOS_ESCALONADOS:
+        valores = df[campo].replace(
+            [np.inf, -np.inf], np.nan
+        )
+
+        # Registra se o valor estava ausente
+        df[f"{campo}_missing"] = valores.isna().astype(int)
+
+        # Substitui valores ausentes por zero
+        df[campo] = np.log1p(valores.fillna(0).clip(lower=0))
+
+    # 3. Trata os demais campos numéricos
+    for campo in CAMPOS_NUMERICOS:
+        df[campo] = (
+            df[campo]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+        )
+
+    for campo in ("src_port", "dst_port"):
+        valores = df[campo]
+
+        valido = (
+            valores.between(0, 65535)
+            & (valores % 1 == 0)
+        )
+
+        df[campo] = valores.where(valido, 0)
+
     df["severity"] /= 4
     df["src_port"] /= 65535
     df["dst_port"] /= 65535
