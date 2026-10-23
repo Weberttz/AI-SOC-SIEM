@@ -77,6 +77,7 @@ def extrair_features(caminho_arquivo, caminho_destino):
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df['hour'] = df['timestamp'].dt.hour
     df['day_of_week'] = df['timestamp'].dt.dayofweek
+    df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
     
     # Extração de Metadados de IP (Antes de dropar as colunas de IP originais)
     df['is_src_private'] = df['src_ip'].apply(eh_ip_privado)
