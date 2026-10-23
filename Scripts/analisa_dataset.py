@@ -1,68 +1,75 @@
 import json
+import argparse
 from collections import Counter
 from pathlib import Path
 
-raiz_do_projeto = Path(__file__).resolve().parent.parent
-arquivo = raiz_do_projeto / "Logs_unificados/unificado.jsonl"
+def analisar_dados(arquivo):
+    total = 0
+    fontes = Counter()
+    tipos = Counter()
+    campos_presentes = Counter()
+    campos_ausentes = Counter()
+    campos_vazios = Counter()
+    campos = set()
+    timestamps = []
+    with open(arquivo, "r", encoding="utf-8") as f:
+        for linha in f:
+            if not linha.strip():
+                continue
 
-total = 0
-fontes = Counter()
-tipos = Counter()
-campos_presentes = Counter()
-campos_ausentes = Counter()
-campos_vazios = Counter()
-campos = set()
-timestamps = []
+            try:
+                evento = json.loads(linha)
+            except json.JSONDecodeError:
+                print("Linha JSON inválida encontrada.")
+                continue
 
-with open(arquivo, "r", encoding="utf-8") as f:
-    for linha in f:
-        if not linha.strip():
-            continue
+            total += 1
+            fontes[evento.get("source_tool") or "(sem fonte)"] += 1
+            tipos[evento.get("event_type") or "(sem tipo)"] += 1
 
-        try:
-            evento = json.loads(linha)
-        except json.JSONDecodeError:
-            print("Linha JSON inválida encontrada.")
-            continue
+            campos.update(evento.keys())
 
-        total += 1
-        fontes[evento.get("source_tool") or "(sem fonte)"] += 1
-        tipos[evento.get("event_type") or "(sem tipo)"] += 1
+            for campo, valor in evento.items():
+                if valor is None:
+                    campos_ausentes[campo] += 1
+                elif valor == "" or valor == [] or valor == {}:
+                    campos_vazios[campo] += 1
+                else:
+                    campos_presentes[campo] += 1
 
-        campos.update(evento.keys())
+            if evento.get("timestamp"):
+                timestamps.append(evento["timestamp"])
 
-        for campo, valor in evento.items():
-            if valor is None:
-                campos_ausentes[campo] += 1
-            elif valor == "" or valor == [] or valor == {}:
-                campos_vazios[campo] += 1
-            else:
-                campos_presentes[campo] += 1
+    print(f"\nTotal de eventos: {total}")
 
-        if evento.get("timestamp"):
-            timestamps.append(evento["timestamp"])
+    print("\nEventos por fonte:")
+    for fonte, quantidade in fontes.most_common():
+        print(f"  {fonte}: {quantidade}")
 
-print(f"\nTotal de eventos: {total}")
+    print("\nTipos de eventos mais frequentes:")
+    for tipo, quantidade in tipos.most_common(20):
+        print(f"  {tipo}: {quantidade}")
 
-print("\nEventos por fonte:")
-for fonte, quantidade in fontes.most_common():
-    print(f"  {fonte}: {quantidade}")
+    print("\nCampos encontrados:")
+    for campo in sorted(campos):
+        presentes = campos_presentes[campo]
+        ausentes = campos_ausentes[campo]
+        vazios = campos_vazios[campo]
+        print(
+            f"  {campo}: preenchidos={presentes}, "
+            f"null={ausentes}, vazios={vazios}"
+        )
 
-print("\nTipos de eventos mais frequentes:")
-for tipo, quantidade in tipos.most_common(20):
-    print(f"  {tipo}: {quantidade}")
+    if timestamps:
+        print("\nPeríodo coberto pelos timestamps:")
+        print(f"  Primeiro: {min(timestamps)}")
+        print(f"  Último:   {max(timestamps)}")
 
-print("\nCampos encontrados:")
-for campo in sorted(campos):
-    presentes = campos_presentes[campo]
-    ausentes = campos_ausentes[campo]
-    vazios = campos_vazios[campo]
-    print(
-        f"  {campo}: preenchidos={presentes}, "
-        f"null={ausentes}, vazios={vazios}"
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Analisa dados dos logs unificados.")
+    parser.add_argument("-i", "--input", required=True, help="arquivo CSV ou JSONL de entrada")
+    args = parser.parse_args()
+    analisar_dados(Path(args.input))
 
-if timestamps:
-    print("\nPeríodo coberto pelos timestamps:")
-    print(f"  Primeiro: {min(timestamps)}")
-    print(f"  Último:   {max(timestamps)}")
+if __name__ == "__main__":
+    main()
