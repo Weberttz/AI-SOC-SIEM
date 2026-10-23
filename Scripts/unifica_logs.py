@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
-r"""Normaliza logs de Suricata, Zeek, Wazuh, Cowrie, Dionaea e Heralding.
-Um evento por linha, usando os mesmos campos normalizados em inglês.
+r"""Unifica logs de Suricata, Zeek, Wazuh, Cowrie, Dionaea e Heralding.
+
+Cada evento utiliza os mesmos 26 campos, cujos nomes permanecem em inglês.
+
 Uso:
-    python unifica_logs.py -o unificado.csv \
+    python unifica_logs_corrigido.py -o unificado.csv \
         --suricata /var/log/suricata/eve.json \
         --zeek /opt/zeek/logs/current/conn.log \
         --wazuh /var/ossec/logs/alerts/alerts.json \
         --cowrie /home/cowrie/var/log/cowrie/cowrie.json \
         --dionaea /opt/dionaea/var/log/dionaea/dionaea.json \
         --heralding /var/log/heralding/log_auth.csv
+
 Aceita vários arquivos ou padrões glob por opção.
 Formato da saída: .csv, .jsonl ou .json. Usa apenas a biblioteca padrão.
+Os nomes dos campos são mantidos em inglês. O campo extra permanece estruturado
+em JSON/JSONL e é serializado como texto apenas no CSV.
+
+Atenção: arquivos unificados podem conter senhas e comandos reais de honeypots.
+Proteja o resultado e use o extrator para gerar vetores sem essas informações.
 """
 import argparse
 import csv
 import glob
 import gzip
 import json
+import math
+import re
+from decimal import Decimal, InvalidOperation
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 OPCOES = {"cowrie_full": False, "dionaea_tz": "+00:00"}
 
 
-# --- esquema ----
+# ---------------------------------------------------------------- esquema ----
 ESQUEMA = [
     "timestamp",        # UTC, ISO8601
     "source_tool",      # suricata | zeek | wazuh | cowrie | dionaea | heralding
@@ -75,40 +87,64 @@ def primeiro_preenchido(dados, *caminhos, padrao=None):
 
 
 def para_inteiro(valor):
-    try:
-        return int(float(valor))
-    except (TypeError, ValueError):
+    """Converte inteiros sem truncamento ou perda de precisão via float."""
+    if valor is None or isinstance(valor, bool):
         return None
+    try:
+        numero = Decimal(str(valor))
+        if not numero.is_finite() or numero != numero.to_integral_value():
+            return None
+        return int(numero)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+
+
+def para_porta(valor):
+    """Portas TCP/UDP inteiras entre 0 e 65535; caso contrário, None."""
+    porta = para_inteiro(valor)
+    return porta if porta is not None and 0 <= porta <= 65535 else None
+
 
 def para_decimal(valor):
     try:
-        return float(valor)
-    except (TypeError, ValueError):
+        numero = float(valor)
+        return numero if math.isfinite(numero) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
+
 def normalizar_data_hora(valor):
-    """Converte ISO8601 ou epoch (s, ms ou µs) para ISO8601 UTC."""
-    if valor in (None, "", "-"):
+    """Converte ISO8601 ou epoch (segundos, ms, µs, ns) para UTC.
+
+    Datas ISO8601 sem fuso são interpretadas como UTC. Valores inválidos viram None.
+    """
+    if valor is None or valor == "" or valor == "-":
         return None
-    try:
-        numero = float(valor)
-        # Descobre a unidade pela magnitude
-        while numero > 1e11:      # > ano ~5138 em segundos => está em ms/µs/ns
+
+    numero = para_decimal(valor)
+    if numero is not None:
+        # Aceita epoch até nanossegundos. Magnitudes acima disso são inválidas.
+        if abs(numero) > 1e20:
+            return None
+        while abs(numero) > 1e11:
             numero /= 1000.0
-        return datetime.fromtimestamp(numero, tz=timezone.utc).isoformat(timespec="microseconds")
-    except (TypeError, ValueError):
-        pass
-    texto = str(valor).strip().replace("Z", "+00:00")
-    # '+0000' -> '+00:00' para compatibilidade com versões antigas do Python
+        try:
+            return datetime.fromtimestamp(numero, tz=timezone.utc).isoformat(timespec="microseconds")
+        except (ValueError, OverflowError, OSError):
+            return None
+
+    texto = str(valor).strip()
+    if texto.endswith("Z"):
+        texto = texto[:-1] + "+00:00"
     if len(texto) > 5 and texto[-5] in "+-" and texto[-3] != ":":
         texto = texto[:-2] + ":" + texto[-2:]
     try:
         data_hora = datetime.fromisoformat(texto)
-    except ValueError:
-        return str(valor)  # mantém original em vez de perder o dado
-    if data_hora.tzinfo is None:
-        data_hora = data_hora.replace(tzinfo=timezone.utc)
-    return data_hora.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        if data_hora.tzinfo is None:
+            data_hora = data_hora.replace(tzinfo=timezone.utc)
+        return data_hora.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def normalizar_protocolo(valor):
@@ -122,15 +158,19 @@ def severidade_suricata(valor):          # 1 = alto ... 3 = baixo (conforme cat�
 
 
 def severidade_wazuh(valor):             # rule.level 0-16
-    """Descreve a severidade do Wazuh."""
+    """Classifica níveis do Wazuh em cinco faixas configuradas neste projeto."""
     nivel_regra = para_inteiro(valor)
     if nivel_regra is None:
         return None
+    # Faixas propostas para aprendizado de máquina, não uma tabela oficial de riscos.
+    # 0–3: info, 4–6: low, 7–9: medium, 10–12: high, >=13: critical.
     if nivel_regra <= 3:
         return "info"
-    if nivel_regra <= 7:
+    if nivel_regra <= 6:
         return "low"
-    if nivel_regra <= 11:
+    if nivel_regra <= 9:
+        return "medium"
+    if nivel_regra <= 12:
         return "high"
     return "critical"
 
@@ -144,7 +184,7 @@ def novo_registro(ferramenta, caminho_log):
 
 def finalizar_registro(registro, extras):
     """Acrescenta campos específicos da ferramenta ao registro normalizado."""
-    registro["extra"] = json.dumps(extras, ensure_ascii=False, default=str) if extras else None
+    registro["extra"] = extras if extras else None
     return registro
 
 
@@ -155,8 +195,8 @@ def campos_restantes(evento, chaves_superiores_usadas):
 
 def abrir_texto(caminho):
     if caminho.endswith(".gz"):
-        return gzip.open(caminho, "rt", encoding="utf-8", errors="replace")
-    return open(caminho, "r", encoding="utf-8", errors="replace", newline="")
+        return gzip.open(caminho, "rt", encoding="utf-8-sig", errors="replace")
+    return open(caminho, "r", encoding="utf-8-sig", errors="replace", newline="")
 
 
 def iterar_jsonl(caminho):
@@ -167,142 +207,210 @@ def iterar_jsonl(caminho):
             if not linha:
                 continue
             try:
-                yield json.loads(linha)
-            except json.JSONDecodeError:
-                print(f"[aviso] {caminho}:{contador} linha JSON inválida, ignorada", file=sys.stderr)
+                evento = json.loads(linha)
+                if not isinstance(evento, dict):
+                    raise ValueError("esperado objeto JSON, não lista ou valor simples")
+                yield evento
+            except (json.JSONDecodeError, ValueError) as erro:
+                print(f"[aviso] {caminho}:{contador} evento ignorado: {erro}", file=sys.stderr)
 
 
 # ---- analisadores de logs ----
 def analisar_suricata(caminho):
     for evento in iterar_jsonl(caminho):
-        registro = novo_registro("suricata", caminho)
-        registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
-        registro["event_type"] = evento.get("event_type")
-        registro["src_ip"], registro["src_port"] = evento.get("src_ip"), para_inteiro(evento.get("src_port"))
-        registro["dst_ip"], registro["dst_port"] = evento.get("dest_ip"), para_inteiro(evento.get("dest_port"))
-        registro["proto"] = normalizar_protocolo(evento.get("proto"))
-        registro["app_proto"] = evento.get("app_proto")
-        registro["session_id"] = evento.get("flow_id")
-        alerta = evento.get("alert") or {}
-        if alerta:
-            registro["severity_orig"] = alerta.get("severity")
-            registro["severity"] = severidade_suricata(alerta.get("severity"))
-            registro["signature"] = alerta.get("signature")
-            registro["signature_id"] = alerta.get("signature_id")
-            registro["category"] = alerta.get("category")
-        else:
-            registro["severity"] = "info"
-        detalhes = evento.get("flow") or {}
-        registro["pkts_to_server"] = para_inteiro(detalhes.get("pkts_toserver"))
-        registro["pkts_to_client"] = para_inteiro(detalhes.get("pkts_toclient"))
-        registro["bytes_to_server"] = para_inteiro(detalhes.get("bytes_toserver"))
-        registro["bytes_to_client"] = para_inteiro(detalhes.get("bytes_toclient"))
-        registro["duration_s"] = para_decimal(detalhes.get("age"))
-        extras = campos_restantes(evento, {"timestamp", "event_type", "src_ip", "src_port", "dest_ip",
-                          "dest_port", "proto", "app_proto", "flow_id"})
-        # remove o que já foi mapeado dentro de alert/flow
-        if alerta:
-            extras["alert"] = {chave: valor for chave, valor in alerta.items() if chave not in
-                              ("severity", "signature", "signature_id", "category")}
-        if detalhes:
-            extras["flow"] = {chave: valor for chave, valor in detalhes.items() if chave not in
-                             ("pkts_toserver", "pkts_toclient", "bytes_toserver",
-                              "bytes_toclient", "age")}
-        yield finalizar_registro(registro, extras)
+        try:
+            registro = novo_registro("suricata", caminho)
+            registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
+            registro["event_type"] = evento.get("event_type")
+            registro["src_ip"], registro["src_port"] = evento.get("src_ip"), para_porta(evento.get("src_port"))
+            registro["dst_ip"], registro["dst_port"] = evento.get("dest_ip"), para_porta(evento.get("dest_port"))
+            registro["proto"] = normalizar_protocolo(evento.get("proto"))
+            registro["app_proto"] = evento.get("app_proto")
+            registro["session_id"] = evento.get("flow_id")
+            alerta = evento.get("alert") or {}
+            if not isinstance(alerta, dict):
+                alerta = {}
+            if alerta:
+                registro["severity_orig"] = alerta.get("severity")
+                registro["severity"] = severidade_suricata(alerta.get("severity"))
+                registro["signature"] = alerta.get("signature")
+                registro["signature_id"] = alerta.get("signature_id")
+                registro["category"] = alerta.get("category")
+            else:
+                registro["severity"] = "info"
+            detalhes = evento.get("flow") or {}
+            if not isinstance(detalhes, dict):
+                detalhes = {}
+            registro["pkts_to_server"] = para_inteiro(detalhes.get("pkts_toserver"))
+            registro["pkts_to_client"] = para_inteiro(detalhes.get("pkts_toclient"))
+            registro["bytes_to_server"] = para_inteiro(detalhes.get("bytes_toserver"))
+            registro["bytes_to_client"] = para_inteiro(detalhes.get("bytes_toclient"))
+            registro["duration_s"] = para_decimal(detalhes.get("age"))
+            extras = campos_restantes(evento, {"timestamp", "event_type", "src_ip", "src_port", "dest_ip",
+                              "dest_port", "proto", "app_proto", "flow_id", "alert", "flow"})
+            # remove o que já foi mapeado dentro de alert/flow
+            if alerta:
+                extras["alert"] = {chave: valor for chave, valor in alerta.items() if chave not in
+                                  ("severity", "signature", "signature_id", "category")}
+            if detalhes:
+                extras["flow"] = {chave: valor for chave, valor in detalhes.items() if chave not in
+                                 ("pkts_toserver", "pkts_toclient", "bytes_toserver",
+                                  "bytes_toclient", "age")}
+            yield finalizar_registro(registro, extras)
+        except Exception as erro:
+            print(f"[aviso] analisar_suricata: evento inválido em {caminho}: {erro}", file=sys.stderr)
+            continue
 
-
-CAMPOS_CONEXAO_ZEEK = ["ts", "uid", "id.orig_h", "id.orig_p", "id.resp_h", "id.resp_p", "proto",
-                    "service", "duration", "orig_bytes", "resp_bytes", "conn_state"]
 
 def iterar_zeek(caminho):
-    """Aceita Zeek em JSON (uma linha por evento) ou TSV padrão (#fields)."""
+    """Aceita Zeek JSONL e TSV com cabeçalho #fields/#path."""
     with abrir_texto(caminho) as arquivo:
         campos, separador, ausente, vazio = None, "\t", "-", "(empty)"
-        for linha in arquivo:
-            linha = linha.rstrip("\n")
+        tipo_log = None
+
+        for numero_linha, linha in enumerate(arquivo, 1):
+            linha = linha.rstrip("\r\n")
             if not linha:
                 continue
+
             if linha.startswith("#"):
                 if linha.startswith("#separator"):
                     texto = linha.split(" ", 1)[1].strip()
-                    separador = bytes(texto, "utf-8").decode("unicode_escape") if texto.startswith("\\x") else texto
+                    separador = (bytes(texto, "utf-8").decode("unicode_escape")
+                                 if texto.startswith("\\x") else texto)
                 elif linha.startswith("#fields"):
                     campos = linha.split(separador)[1:]
                 elif linha.startswith("#unset_field"):
                     ausente = linha.split(separador)[1]
+                elif linha.startswith("#empty_field"):
+                    vazio = linha.split(separador)[1]
+                elif linha.startswith("#path"):
+                    tipo_log = linha.split(separador, 1)[-1].strip()
                 continue
+
             if linha.startswith("{"):
                 try:
-                    yield json.loads(linha)
-                except json.JSONDecodeError:
-                    pass
+                    evento = json.loads(linha)
+                    if isinstance(evento, dict):
+                        if tipo_log:
+                            evento["__zeek_path"] = tipo_log
+                        yield evento
+                    else:
+                        raise ValueError("esperado objeto")
+                except (json.JSONDecodeError, ValueError) as erro:
+                    print(f"[aviso] {caminho}:{numero_linha} Zeek ignorado: {erro}", file=sys.stderr)
                 continue
+
             if campos:
                 valores = linha.split(separador)
-                yield {chave: (None if valor in (ausente, vazio) else valor) for chave, valor in zip(campos, valores)}
+                if len(valores) != len(campos):
+                    print(f"[aviso] {caminho}:{numero_linha} TSV com quantidade incorreta de colunas", file=sys.stderr)
+                    continue
+                evento = {chave: (None if valor in (ausente, vazio) else valor)
+                          for chave, valor in zip(campos, valores)}
+                evento["__zeek_path"] = tipo_log
+                yield evento
+
+
+def tipo_evento_zeek(evento, caminho):
+    """Infere conn/dns/http/ssh/ssl sem rotular tudo como conexão."""
+    tipo = evento.get("__zeek_path") or evento.get("log_type")
+    if not tipo:
+        nome = Path(caminho).name.lower()
+        for candidato in ("conn", "dns", "http", "ssh", "ssl", "tls"):
+            if nome == f"{candidato}.log" or nome.startswith(f"{candidato}.log."):
+                tipo = candidato
+                break
+
+    if not tipo:
+        if "query" in evento and ("qtype" in evento or "qtype_name" in evento):
+            tipo = "dns"
+        elif "method" in evento and "host" in evento:
+            tipo = "http"
+        elif "auth_success" in evento:
+            tipo = "ssh"
+        elif "server_name" in evento and "cipher" in evento:
+            tipo = "ssl"
+        elif "conn_state" in evento:
+            tipo = "conn"
+
+    return str(tipo).lower() if tipo else "zeek_event"
+
 
 def analisar_zeek(caminho):
     for evento in iterar_zeek(caminho):
-        registro = novo_registro("zeek", caminho)
-        registro["timestamp"] = normalizar_data_hora(evento.get("ts"))
-        registro["event_type"] = "conn"
-        registro["src_ip"], registro["src_port"] = obter_campo(evento, "id.orig_h"), para_inteiro(obter_campo(evento, "id.orig_p"))
-        registro["dst_ip"], registro["dst_port"] = obter_campo(evento, "id.resp_h"), para_inteiro(obter_campo(evento, "id.resp_p"))
-        registro["proto"] = normalizar_protocolo(evento.get("proto"))
-        registro["app_proto"] = evento.get("service")
-        registro["severity"] = "info"
-        registro["session_id"] = (evento.get("uid") or "").strip() or None
-        registro["pkts_to_server"] = para_inteiro(evento.get("orig_pkts"))
-        registro["pkts_to_client"] = para_inteiro(evento.get("resp_pkts"))
-        registro["bytes_to_server"] = para_inteiro(evento.get("orig_bytes"))
-        registro["bytes_to_client"] = para_inteiro(evento.get("resp_bytes"))
-        registro["duration_s"] = para_decimal(evento.get("duration"))
-        chaves_usadas = {"ts", "uid", "id.orig_h", "id.orig_p", "id.resp_h", "id.resp_p", "proto",
-                "service", "duration", "orig_bytes", "resp_bytes", "orig_pkts", "resp_pkts"}
-        # Zeek em JSON às vezes aninha 'id': {orig_h...}
-        extras = campos_restantes(evento, chaves_usadas | {"id"})
-        yield finalizar_registro(registro, extras)
+        try:
+            registro = novo_registro("zeek", caminho)
+            registro["timestamp"] = normalizar_data_hora(evento.get("ts"))
+            registro["event_type"] = tipo_evento_zeek(evento, caminho)
+            registro["src_ip"], registro["src_port"] = obter_campo(evento, "id.orig_h"), para_porta(obter_campo(evento, "id.orig_p"))
+            registro["dst_ip"], registro["dst_port"] = obter_campo(evento, "id.resp_h"), para_porta(obter_campo(evento, "id.resp_p"))
+            registro["proto"] = normalizar_protocolo(evento.get("proto"))
+            registro["app_proto"] = evento.get("service") or (
+                registro["event_type"] if registro["event_type"] in ("dns", "http", "ssh", "ssl", "tls") else None
+            )
+            registro["severity"] = "info"
+            registro["session_id"] = str(evento.get("uid") or "").strip() or None
+            registro["pkts_to_server"] = para_inteiro(evento.get("orig_pkts"))
+            registro["pkts_to_client"] = para_inteiro(evento.get("resp_pkts"))
+            registro["bytes_to_server"] = para_inteiro(evento.get("orig_bytes"))
+            registro["bytes_to_client"] = para_inteiro(evento.get("resp_bytes"))
+            registro["duration_s"] = para_decimal(evento.get("duration"))
+            chaves_usadas = {"ts", "uid", "id.orig_h", "id.orig_p", "id.resp_h", "id.resp_p", "proto",
+                    "service", "duration", "orig_bytes", "resp_bytes", "orig_pkts", "resp_pkts"}
+            # Zeek em JSON às vezes aninha 'id': {orig_h...}
+            extras = campos_restantes(evento, chaves_usadas | {"id", "__zeek_path"})
+            yield finalizar_registro(registro, extras)
+        except Exception as erro:
+            print(f"[aviso] analisar_zeek: evento inválido em {caminho}: {erro}", file=sys.stderr)
+            continue
 
 
 def analisar_wazuh(caminho):
     """alerts.json do Wazuh (uma linha por alerta). O evento original da ferramenta
     monitorada fica em 'data.*' e é preservado em extra['data']."""
     for evento in iterar_jsonl(caminho):
-        registro = novo_registro("wazuh", caminho)
-        registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
-        dados_evento = evento.get("data") or {}
-        registro["event_type"] = "alert"
-        # Campos de rede variam conforme o decoder (suricata, cowrie, sshd...)
-        registro["src_ip"] = primeiro_preenchido(dados_evento, "src_ip", "srcip", "id.orig_h")
-        registro["src_port"] = para_inteiro(primeiro_preenchido(dados_evento, "src_port", "srcport", "id.orig_p"))
-        registro["dst_ip"] = primeiro_preenchido(dados_evento, "dest_ip", "dst_ip", "dstip", "id.resp_h")
-        registro["dst_port"] = para_inteiro(primeiro_preenchido(dados_evento, "dest_port", "dst_port", "dstport", "id.resp_p"))
-        registro["proto"] = normalizar_protocolo(primeiro_preenchido(dados_evento, "proto", "protocol"))
-        registro["app_proto"] = primeiro_preenchido(dados_evento, "app_proto")
-        regra = evento.get("rule") or {}
-        registro["severity_orig"] = regra.get("level")
-        registro["severity"] = severidade_wazuh(regra.get("level"))
-        registro["signature"] = regra.get("description")
-        registro["signature_id"] = regra.get("id")
-        registro["category"] = ",".join(regra["groups"]) if isinstance(regra.get("groups"), list) else None
-        registro["session_id"] = primeiro_preenchido(dados_evento, "flow_id", "session")
-        registro["username"] = primeiro_preenchido(dados_evento, "dstuser", "srcuser", "username")
-        registro["agent_name"] = obter_campo(evento, "agent.name")
-        extras = {
-            "agent": evento.get("agent"),
-            "manager": evento.get("manager"),
-            "location": evento.get("location"),
-            "decoder": evento.get("decoder"),
-            "rule_extra": {chave: regra.get(chave) for chave in
-                           ("firedtimes", "mitre", "pci_dss", "gdpr", "hipaa", "nist_800_53")
-                           if regra.get(chave) is not None},
-            "data": dados_evento or None,
-            "full_log": evento.get("full_log"),
-        }
-        extras = {chave: valor for chave, valor in extras.items() if valor not in (None, {}, [])}
-        yield finalizar_registro(registro, extras)
-
-
+        try:
+            registro = novo_registro("wazuh", caminho)
+            registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
+            dados_evento = evento.get("data") or {}
+            if not isinstance(dados_evento, dict):
+                dados_evento = {}
+            registro["event_type"] = "alert"
+            # Campos de rede variam conforme o decoder (suricata, cowrie, sshd...)
+            registro["src_ip"] = primeiro_preenchido(dados_evento, "src_ip", "srcip", "id.orig_h")
+            registro["src_port"] = para_porta(primeiro_preenchido(dados_evento, "src_port", "srcport", "id.orig_p"))
+            registro["dst_ip"] = primeiro_preenchido(dados_evento, "dest_ip", "dst_ip", "dstip", "id.resp_h")
+            registro["dst_port"] = para_porta(primeiro_preenchido(dados_evento, "dest_port", "dst_port", "dstport", "id.resp_p"))
+            registro["proto"] = normalizar_protocolo(primeiro_preenchido(dados_evento, "proto", "protocol"))
+            registro["app_proto"] = primeiro_preenchido(dados_evento, "app_proto")
+            regra = evento.get("rule") or {}
+            if not isinstance(regra, dict):
+                regra = {}
+            registro["severity_orig"] = regra.get("level")
+            registro["severity"] = severidade_wazuh(regra.get("level"))
+            registro["signature"] = regra.get("description")
+            registro["signature_id"] = regra.get("id")
+            registro["category"] = ",".join(map(str, regra["groups"])) if isinstance(regra.get("groups"), list) else None
+            registro["session_id"] = primeiro_preenchido(dados_evento, "flow_id", "session")
+            registro["username"] = primeiro_preenchido(dados_evento, "dstuser", "srcuser", "username")
+            registro["agent_name"] = obter_campo(evento, "agent.name")
+            extras = {
+                "agent": evento.get("agent"),
+                "manager": evento.get("manager"),
+                "location": evento.get("location"),
+                "decoder": evento.get("decoder"),
+                "rule_extra": {chave: regra.get(chave) for chave in
+                               ("firedtimes", "mitre", "pci_dss", "gdpr", "hipaa", "nist_800_53")
+                               if regra.get(chave) is not None},
+                "data": dados_evento or None,
+                "full_log": evento.get("full_log"),
+            }
+            extras = {chave: valor for chave, valor in extras.items() if valor not in (None, {}, [])}
+            yield finalizar_registro(registro, extras)
+        except Exception as erro:
+            print(f"[aviso] analisar_wazuh: evento inválido em {caminho}: {erro}", file=sys.stderr)
+            continue
 CAMPOS_EXTENSOS_COWRIE = {"hasshAlgorithms", "kexAlgs", "keyAlgs", "encCS", "macCS", "compCS", "langCS"}
 
 
@@ -312,36 +420,42 @@ def analisar_cowrie(caminho):
     As listas enormes de algoritmos do KEX são descartadas (use --cowrie-full
     para mantê-las); o hassh em si é sempre preservado."""
     for evento in iterar_jsonl(caminho):
-        identificador_evento = evento.get("eventid", "")
-        registro = novo_registro("cowrie", caminho)
-        registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
-        registro["event_type"] = identificador_evento.replace("cowrie.", "") or None
-        registro["src_ip"], registro["src_port"] = evento.get("src_ip"), para_inteiro(evento.get("src_port"))
-        registro["dst_ip"], registro["dst_port"] = evento.get("dst_ip"), para_inteiro(evento.get("dst_port"))
-        registro["proto"] = "tcp"
-        registro["app_proto"] = evento.get("protocol") or "ssh"
-        registro["session_id"] = evento.get("session")
-        registro["username"], registro["password"] = evento.get("username"), evento.get("password")
-        registro["payload"] = evento.get("input") or evento.get("url")
-        milissegundos = para_decimal(evento.get("duration_ms"))
-        registro["duration_s"] = milissegundos / 1000.0 if milissegundos is not None else para_decimal(evento.get("duration"))
-        registro["signature"] = evento.get("message") or None
-        if identificador_evento.startswith("cowrie.login"):
-            registro["severity"] = "low"
-        elif identificador_evento in ("cowrie.command.input", "cowrie.session.file_download",
-                     "cowrie.session.file_upload"):
-            registro["severity"] = "medium"
-        else:
-            registro["severity"] = "info"
-        ignorar = {"timestamp", "eventid", "src_ip", "src_port", "dst_ip", "dst_port", "protocol",
-                "session", "username", "password", "input", "duration_ms", "duration",
-                "message", "uuid"}
-        if not OPCOES["cowrie_full"]:
-            ignorar |= CAMPOS_EXTENSOS_COWRIE
-        yield finalizar_registro(registro, campos_restantes(evento, ignorar))
-
-
-import re
+        try:
+            identificador_evento = evento.get("eventid") or ""
+            if not isinstance(identificador_evento, str):
+                identificador_evento = str(identificador_evento)
+            registro = novo_registro("cowrie", caminho)
+            registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
+            registro["event_type"] = identificador_evento.removeprefix("cowrie.") or None
+            registro["src_ip"], registro["src_port"] = evento.get("src_ip"), para_porta(evento.get("src_port"))
+            registro["dst_ip"], registro["dst_port"] = evento.get("dst_ip"), para_porta(evento.get("dst_port"))
+            registro["proto"] = "tcp"
+            # Não presumir SSH quando o protocolo estiver ausente: Cowrie também aceita Telnet.
+            registro["app_proto"] = normalizar_protocolo(evento.get("protocol"))
+            if not registro["app_proto"] and ".telnet." in identificador_evento:
+                registro["app_proto"] = "telnet"
+            registro["session_id"] = evento.get("session")
+            registro["username"], registro["password"] = evento.get("username"), evento.get("password")
+            registro["payload"] = evento.get("input") or evento.get("url")
+            milissegundos = para_decimal(evento.get("duration_ms"))
+            registro["duration_s"] = milissegundos / 1000.0 if milissegundos is not None else para_decimal(evento.get("duration"))
+            registro["signature"] = evento.get("message") or None
+            if identificador_evento.startswith("cowrie.login"):
+                registro["severity"] = "low"
+            elif identificador_evento in ("cowrie.command.input", "cowrie.session.file_download",
+                         "cowrie.session.file_upload"):
+                registro["severity"] = "medium"
+            else:
+                registro["severity"] = "info"
+            ignorar = {"timestamp", "eventid", "src_ip", "src_port", "dst_ip", "dst_port", "protocol",
+                    "session", "username", "password", "input", "duration_ms", "duration",
+                    "message"}
+            if not OPCOES["cowrie_full"]:
+                ignorar |= CAMPOS_EXTENSOS_COWRIE
+            yield finalizar_registro(registro, campos_restantes(evento, ignorar))
+        except Exception as erro:
+            print(f"[aviso] analisar_cowrie: evento inválido em {caminho}: {erro}", file=sys.stderr)
+            continue
 
 
 _D_LINHA = re.compile(r"^\[(\d{2})(\d{2})(\d{4}) (\d{2}:\d{2}:\d{2})\] (\S+) (\S+?)-(\w+): ?(.*)$")
@@ -374,9 +488,13 @@ def analisar_dionaea(caminho):
       * dionaea.log (texto/debug): reconstrói conexões a partir das linhas
         'log_sqlite ... accepted/connect connection ...' e liga cada incidente
         (login FTP, download, DCERPC...) à conexão pelo ponteiro 'con: (ptr)'.
-      * JSON por linha (se a primeira linha começar com '{')."""
+      * JSONL (detectado pela primeira linha não vazia)."""
     with abrir_texto(caminho) as arquivo:
-        cabecalho = arquivo.readline().strip()
+        cabecalho = ""
+        for linha in arquivo:
+            if linha.strip():
+                cabecalho = linha.strip()
+                break
     if cabecalho.startswith("{"):
         yield from _analisar_dionaea_json(caminho)
         return
@@ -488,8 +606,8 @@ def analisar_dionaea(caminho):
                 else:
                     ip_destino, porta_destino, ip_origem, porta_origem, identificador_conexao = conexao_saida.groups()      # honeypot -> remoto
                     tipo_evento = "connection_outbound"
-                informacoes = {"src_ip": ip_origem, "src_port": para_inteiro(porta_origem), "dst_ip": ip_destino,
-                        "dst_port": para_inteiro(porta_destino), "proto": protocolo, "sid": f"run{execucao}-{identificador_conexao}",
+                informacoes = {"src_ip": ip_origem, "src_port": para_porta(porta_origem), "dst_ip": ip_destino,
+                        "dst_port": para_porta(porta_destino), "proto": protocolo, "sid": f"run{execucao}-{identificador_conexao}",
                         "tls": ".tls." in nome_incidente}
                 if incidente.get("con"):
                     mapa_conexoes[incidente["con"]] = informacoes
@@ -513,25 +631,29 @@ def analisar_dionaea(caminho):
 
 def _analisar_dionaea_json(caminho):
     for evento in iterar_jsonl(caminho):
-        registro = novo_registro("dionaea", caminho)
-        registro["timestamp"] = normalizar_data_hora(primeiro_preenchido(evento, "timestamp", "time", "ts"))
-        conexao = evento.get("connection") if isinstance(evento.get("connection"), dict) else {}
-        registro["event_type"] = primeiro_preenchido(evento, "event_type", "type") or conexao.get("type") or "connection"
-        registro["src_ip"] = primeiro_preenchido(evento, "src_ip", "remote_host", "connection.remote_host")
-        registro["src_port"] = para_inteiro(primeiro_preenchido(evento, "src_port", "remote_port", "connection.remote_port"))
-        registro["dst_ip"] = primeiro_preenchido(evento, "dst_ip", "local_host", "connection.local_host")
-        registro["dst_port"] = para_inteiro(primeiro_preenchido(evento, "dst_port", "local_port", "connection.local_port"))
-        registro["proto"] = normalizar_protocolo(primeiro_preenchido(evento, "transport", "connection.transport"))
-        registro["app_proto"] = primeiro_preenchido(evento, "protocol", "connection.protocol")
-        registro["severity"] = "info"
-        yield finalizar_registro(registro, evento)
+        try:
+            registro = novo_registro("dionaea", caminho)
+            registro["timestamp"] = normalizar_data_hora(primeiro_preenchido(evento, "timestamp", "time", "ts"))
+            conexao = evento.get("connection") if isinstance(evento.get("connection"), dict) else {}
+            registro["event_type"] = primeiro_preenchido(evento, "event_type", "type") or conexao.get("type") or "connection"
+            registro["src_ip"] = primeiro_preenchido(evento, "src_ip", "remote_host", "connection.remote_host")
+            registro["src_port"] = para_porta(primeiro_preenchido(evento, "src_port", "remote_port", "connection.remote_port"))
+            registro["dst_ip"] = primeiro_preenchido(evento, "dst_ip", "local_host", "connection.local_host")
+            registro["dst_port"] = para_porta(primeiro_preenchido(evento, "dst_port", "local_port", "connection.local_port"))
+            registro["proto"] = normalizar_protocolo(primeiro_preenchido(evento, "transport", "connection.transport"))
+            registro["app_proto"] = primeiro_preenchido(evento, "protocol", "connection.protocol")
+            registro["severity"] = "info"
+            yield finalizar_registro(registro, evento)
+        except Exception as erro:
+            print(f"[aviso] _analisar_dionaea_json: evento inválido em {caminho}: {erro}", file=sys.stderr)
+            continue
 
 
 def analisar_heralding(caminho):
     """Heralding: log_auth.csv (padrão) ou JSON por linha.
     Colunas CSV: timestamp,auth_id,session_id,source_ip,source_port,
                  destination_ip,destination_port,protocol,username,password"""
-    formato_json = caminho.endswith((".json", ".jsonl", ".json.gz"))
+    formato_json = caminho.endswith((".json", ".jsonl", ".json.gz", ".jsonl.gz"))
     if formato_json:
         linhas = iterar_jsonl(caminho)
     else:
@@ -540,20 +662,24 @@ def analisar_heralding(caminho):
                 yield from csv.DictReader(arquivo)
         linhas = _ler_csv()
     for evento in linhas:
-        registro = novo_registro("heralding", caminho)
-        registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
-        registro["event_type"] = "auth"
-        registro["src_ip"] = primeiro_preenchido(evento, "source_ip", "src_ip")
-        registro["src_port"] = para_inteiro(primeiro_preenchido(evento, "source_port", "src_port"))
-        registro["dst_ip"] = primeiro_preenchido(evento, "destination_ip", "dest_ip", "dst_ip")
-        registro["dst_port"] = para_inteiro(primeiro_preenchido(evento, "destination_port", "dest_port", "dst_port"))
-        registro["proto"] = "tcp"
-        registro["app_proto"] = (evento.get("protocol") or "").lower() or None
-        registro["session_id"] = evento.get("session_id")
-        registro["username"], registro["password"] = evento.get("username"), evento.get("password")
-        registro["severity"] = "low"
-        extras = {chave: evento[chave] for chave in ("auth_id", "num_auth_attempts") if chave in evento}
-        yield finalizar_registro(registro, extras)
+        try:
+            registro = novo_registro("heralding", caminho)
+            registro["timestamp"] = normalizar_data_hora(evento.get("timestamp"))
+            registro["event_type"] = "auth"
+            registro["src_ip"] = primeiro_preenchido(evento, "source_ip", "src_ip")
+            registro["src_port"] = para_porta(primeiro_preenchido(evento, "source_port", "src_port"))
+            registro["dst_ip"] = primeiro_preenchido(evento, "destination_ip", "dest_ip", "dst_ip")
+            registro["dst_port"] = para_porta(primeiro_preenchido(evento, "destination_port", "dest_port", "dst_port"))
+            registro["proto"] = "tcp"
+            registro["app_proto"] = normalizar_protocolo(evento.get("protocol"))
+            registro["session_id"] = evento.get("session_id")
+            registro["username"], registro["password"] = evento.get("username"), evento.get("password")
+            registro["severity"] = "low"
+            extras = {chave: evento[chave] for chave in ("auth_id", "num_auth_attempts") if chave in evento}
+            yield finalizar_registro(registro, extras)
+        except Exception as erro:
+            print(f"[aviso] analisar_heralding: evento inválido em {caminho}: {erro}", file=sys.stderr)
+            continue
 
 
 ANALISADORES = {
@@ -589,25 +715,36 @@ def coletar_registros(argumentos):
 
 
 def gravar_saida(registros, saida):
-    extensao = saida.lower().rsplit(".", 1)[-1]
-    if extensao == "csv":
-        with open(saida, "w", newline="", encoding="utf-8") as arquivo:
+    """Grava incrementalmente CSV, JSONL ou JSON, sem carregar tudo na RAM."""
+    extensao = Path(saida).suffix.lower()
+    if extensao not in (".csv", ".jsonl", ".json"):
+        raise ValueError("Extensão de saída deve ser .csv, .jsonl ou .json")
+
+    Path(saida).parent.mkdir(parents=True, exist_ok=True)
+    with open(saida, "w", encoding="utf-8", newline="") as arquivo:
+        if extensao == ".csv":
             escritor = csv.DictWriter(arquivo, fieldnames=ESQUEMA)
             escritor.writeheader()
             for registro in registros:
-                escritor.writerow(registro)
-    elif extensao == "jsonl":
-        with open(saida, "w", encoding="utf-8") as arquivo:
+                linha = registro.copy()
+                if isinstance(linha["extra"], (dict, list)):
+                    linha["extra"] = json.dumps(linha["extra"], ensure_ascii=False, default=str)
+                escritor.writerow(linha)
+        elif extensao == ".jsonl":
             for registro in registros:
-                arquivo.write(json.dumps(registro, ensure_ascii=False) + "\n")
-    elif extensao == "json":
-        with open(saida, "w", encoding="utf-8") as arquivo:
-            json.dump(list(registros), arquivo, ensure_ascii=False, indent=1)
-    else:
-        sys.exit("Extensão de saída deve ser .csv, .jsonl ou .json")
+                arquivo.write(json.dumps(registro, ensure_ascii=False, default=str) + "\n")
+        else:
+            arquivo.write("[\n")
+            primeiro = True
+            for registro in registros:
+                if not primeiro:
+                    arquivo.write(",\n")
+                arquivo.write("  " + json.dumps(registro, ensure_ascii=False, default=str))
+                primeiro = False
+            arquivo.write("\n]\n")
 
 
-def main():
+def principal():
     analisador_argumentos = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     for ferramenta in ANALISADORES:
@@ -634,4 +771,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    principal()
