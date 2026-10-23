@@ -112,7 +112,7 @@ def extrair_features(caminho_arquivo, caminho_destino):
     df_encoded['dst_port'] = df_encoded['dst_port'].fillna(0) / 65535.0
     df_encoded['hour'] = df_encoded['hour'] / 23.0
     df_encoded['day_of_week'] = df_encoded['day_of_week'] / 6.0
-    df_encoded['severity'] = df_encoded['severity'] / 3.0  # Dividido por 3 (já que mapeamos de 0 a 3)
+    df_encoded['severity'] = df_encoded['severity'] / 4.0  # Dividido por 4 (já que mapeamos de 0 a 4)
 
     # Para os campos dinâmicos (bytes e pacotes), mantemos o scaler padrão do sklearn
     scaler = MinMaxScaler()
