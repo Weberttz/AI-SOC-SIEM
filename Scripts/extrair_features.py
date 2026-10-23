@@ -36,7 +36,7 @@ from pathlib import Path
 ]"""
 
 MAPA_SEVERIDADE = {
-    "info": 0, "low": 1, "high": 2, "critical": 3
+    "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4
 }
 
 CAMPOS_CATEGORICOS = ["proto", "source_tool", "app_proto", "event_type"]
