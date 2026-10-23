@@ -1,4 +1,3 @@
-
 """O script Python lerá o JSON unificado e irá aplicar técnicas de tratamento de dados dependendo do tipo de cada campo:
 1. Variáveis Numéricas (Portas, Tamanho do Pacote): Mantêm-se numéricas, mas geralmente aplicamos uma normalização (colocar os valores entre 0 e 1) para que uma porta alta (ex: 54321) não distorça o peso do modelo frente a uma porta baixa (ex: 80).
 2. Variáveis Categóricas/Texto (Protocolo, Tipo de Alerta): Modelos não leem "TCP" ou "UDP". Usamos técnicas como One-Hot Encoding (criar colunas binárias de 0 e 1 para cada opção) ou Label Encoding (atribuir um número para cada categoria).
@@ -37,7 +36,7 @@ from pathlib import Path
 ]"""
 
 MAPA_SEVERIDADE = {
-    "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4,
+    "info": 0, "low": 1, "high": 2, "critical": 3
 }
 
 CAMPOS_CATEGORICOS = ["proto", "source_tool", "app_proto", "event_type"]
@@ -65,7 +64,6 @@ def ler_entrada(caminho_arquivo):
 
 def eh_ip_privado(ip):
     try:
-        # se for nulo ou float (NaN do pandas), joga pro except
         if pd.isna(ip): 
             return 0
         return 1 if ipaddress.ip_address(str(ip).strip()).is_private else 0
@@ -75,15 +73,21 @@ def eh_ip_privado(ip):
 def extrair_features(caminho_arquivo, caminho_destino):
     df = ler_entrada(caminho_arquivo)
 
-    # --- PASSO 2: Tratamento do Timestamp ---
+    # --- PASSO 2: Tratamento do Timestamp e IPs ---
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df['hour'] = df['timestamp'].dt.hour
     df['day_of_week'] = df['timestamp'].dt.dayofweek
+    
+    # Extração de Metadados de IP (Antes de dropar as colunas de IP originais)
     df['is_src_private'] = df['src_ip'].apply(eh_ip_privado)
     df['is_dst_private'] = df['dst_ip'].apply(eh_ip_privado)
+    
+    # Simulação da lista de IPs bloqueados pelo firewall
+    # Adicione aqui dentro o IP real que usou nos testes para dar match (ex: '10.93.46.23')
+    ips_simulados_bloqueados = {'10.93.46.23', '192.168.1.50'} 
+    df['src_ip_blocked'] = df['src_ip'].isin(ips_simulados_bloqueados).astype(int)
 
-    # Passando todas as colunas de uma vez só e salvando de volta no df
-    # Removemos a coluna original de timestamp pois ela não vai para o vetor final
+    # Passando todas as colunas de texto livre de uma vez só e salvando de volta no df
     df = df.drop(columns=[
         'timestamp', 'signature', 'signature_id', 'username', 'password', 'category',
         'payload', 'session_id', 'src_log', 'agent_name', 'extra', 'src_ip', 'dst_ip'
@@ -92,20 +96,28 @@ def extrair_features(caminho_arquivo, caminho_destino):
     # --- PASSO 3: Tratamento de Variáveis Categóricas (One-Hot Encoding) ---
     df_encoded = pd.get_dummies(df, columns=CAMPOS_CATEGORICOS, dtype=int)
 
-    # --- PASSO 4: Normalização de Valores Numéricos (Colocar entre 0 e 1) ---
-    scaler = MinMaxScaler()
+    # --- PASSO 4: Tratamento da Severidade Textual ---
     df_encoded['severity'] = df_encoded['severity'].fillna('info')
+    df_encoded['severity'] = df_encoded['severity'].map(MAPA_SEVERIDADE)
+    # Se algum valor novo não mapeado surgir, vira 0 (info)
+    df_encoded['severity'] = df_encoded['severity'].fillna(0)
 
+    # Preenchimento de nulos para pacotes/bytes e duração
     for campo in CAMPOS_ESCALONADOS:
         df_encoded[campo] = df_encoded[campo].fillna(0)
 
-    df_encoded['severity'] = df_encoded['severity'].map(MAPA_SEVERIDADE)
+    # --- PASSO 5: Normalização Matemática Fixa (Sem vazamento de dados!) ---
+    df_encoded['src_port'] = df_encoded['src_port'].fillna(0) / 65535.0
+    df_encoded['dst_port'] = df_encoded['dst_port'].fillna(0) / 65535.0
+    df_encoded['hour'] = df_encoded['hour'] / 23.0
+    df_encoded['day_of_week'] = df_encoded['day_of_week'] / 6.0
+    df_encoded['severity'] = df_encoded['severity'] / 3.0  # Dividido por 3 (já que mapeamos de 0 a 3)
 
-    # Vamos normalizar a porta de destino e a severidade para a mesma escala
-    colunas_normalizadas = ['src_port', 'dst_port', 'hour', 'day_of_week', 'severity']
-    df_encoded[colunas_normalizadas] = scaler.fit_transform(df_encoded[colunas_normalizadas])
+    # Para os campos dinâmicos (bytes e pacotes), mantemos o scaler padrão do sklearn
+    scaler = MinMaxScaler()
+    df_encoded[CAMPOS_ESCALONADOS] = scaler.fit_transform(df_encoded[CAMPOS_ESCALONADOS])
 
-    # --- PASSO 5: Gerando os Vetores de Características ---
+    # --- PASSO 6: Gerando os Vetores de Características ---
     vetores_caracteristicas = df_encoded.to_numpy()
 
     print("=== DataFrame Estruturado (Pronto para IA) ===")
