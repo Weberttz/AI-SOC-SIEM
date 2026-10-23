@@ -21,22 +21,68 @@ MAPA_SEVERIDADE = {
 
 CAMPOS_CATEGORICOS = ["proto", "source_tool", "app_proto", "event_type"]
 
+# Campos numéricos que serão escalonados (normalizados entre 0 e 1)
 CAMPOS_ESCALONADOS = [
     "pkts_to_server", "pkts_to_client",
     "bytes_to_server", "bytes_to_client", "duration_s",
 ]
 
+# Campos que indicam se os campos escalonados estavam ausentes
 CAMPOS_AUSENCIA = [
     f"{campo}_missing"
     for campo in CAMPOS_ESCALONADOS
 ]
 
+# Campos numéricos que não são escalonados, mas ainda assim precisam ser tratados
 CAMPOS_NUMERICOS = [
     "severity", "src_port", "dst_port", 
     *CAMPOS_ESCALONADOS, *CAMPOS_AUSENCIA,
     "hour", "day_of_week", "is_weekend", "is_src_private",
     "is_dst_private", "src_ip_blocked",
 ]
+
+# Eventos operacionais que não são relevantes para a análise de segurança
+EVENTOS_OPERACIONAIS = {
+    "suricata": {
+        "stats"
+    },
+
+    "zeek": {
+        "stats",
+        "telemetry",
+        "capture_loss",
+        "prof",
+        "loaded_scripts",
+        "broker",
+        "reporter",
+        "weird_stats"
+    }
+}
+
+def filtrar_eventos(df):
+    df = df.copy()
+
+    ferramenta = (
+        df["source_tool"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+    )
+
+    tipo = (
+        df["event_type"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+    )
+
+    # Remove eventos operacionais, que não são relevantes para a análise de segurança   
+    remover = [
+        evento in EVENTOS_OPERACIONAIS.get(origem, set())
+        for origem, evento in zip(ferramenta, tipo)
+    ]
+
+    return df.loc[~pd.Series(remover, index=df.index)].copy()
 
 def ler_entrada(caminho_arquivo):
     """Lê o CSV gerado por unifica_logs.py ou um JSONL compatível."""
@@ -156,7 +202,16 @@ def criar_preprocessador():
 
 def extrair_features(caminho_arquivo, caminho_destino, caminho_preprocessador,
                      ajustar):
-    dados = preparar_dados(ler_entrada(caminho_arquivo))
+    df = ler_entrada(caminho_arquivo)
+
+    df = filtrar_eventos(df)
+
+    if df.empty:
+        raise ValueError(
+            "Nenhum evento elegível após a filtragem"
+        )
+
+    dados = preparar_dados(df)
     if ajustar:
         preprocessador = criar_preprocessador()
         transformados = preprocessador.fit_transform(dados)
