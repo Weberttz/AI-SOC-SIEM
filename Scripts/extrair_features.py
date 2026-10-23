@@ -9,31 +9,10 @@ import pandas as pd
 import json 
 import argparse
 import ipaddress
-from sklearn.preprocessing import MinMaxScaler
+import joblib
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from pathlib import Path
-
-"""ESQUEMA = [
-    "timestamp",        # UTC, ISO8601
-    "source_tool",      # suricata | zeek | wazuh | cowrie | dionaea | heralding
-    "event_type",       # alert, flow, auth, session, command...
-    "src_ip", "src_port", "dst_ip", "dst_port",
-    "proto",            # transporte: tcp/udp/icmp (minúsculo)
-    "app_proto",        # aplicação: http, ssh, dns...
-    "severity",         # normalizada: info | low | medium | high | critical
-    "severity_orig",    # valor original da ferramenta
-    "signature",        # nome da regra/assinatura/descrição
-    "signature_id",
-    "category",
-    "session_id",       # flow_id (suricata), uid (zeek), session (cowrie)...
-    "username", "password",
-    "payload",          # comando (cowrie), URL/hash (dionaea), etc.
-    "pkts_to_server", "pkts_to_client",
-    "bytes_to_server", "bytes_to_client",
-    "duration_s",
-    "agent_name",       # wazuh: agente que coletou
-    "src_log",          # arquivo de origem
-    "extra",            # JSON com campos específicos da ferramenta
-]"""
 
 MAPA_SEVERIDADE = {
     "info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4
@@ -42,9 +21,16 @@ MAPA_SEVERIDADE = {
 CAMPOS_CATEGORICOS = ["proto", "source_tool", "app_proto", "event_type"]
 
 CAMPOS_ESCALONADOS = [
-    'severity_orig', 'pkts_to_server', 'pkts_to_client',
-    'bytes_to_server', 'bytes_to_client', 'duration_s'
+    "pkts_to_server", "pkts_to_client",
+    "bytes_to_server", "bytes_to_client", "duration_s",
 ]
+
+CAMPOS_NUMERICOS = [
+    "severity", "src_port", "dst_port", *CAMPOS_ESCALONADOS,
+    "hour", "day_of_week", "is_weekend", "is_src_private",
+    "is_dst_private", "src_ip_blocked",
+]
+
 
 def ler_entrada(caminho_arquivo):
     """Lê o CSV gerado por unifica_logs.py ou um JSONL compatível."""
@@ -62,67 +48,88 @@ def ler_entrada(caminho_arquivo):
                 print(f"Linha JSON inválida encontrada: {numero_linha}")
     return pd.DataFrame(eventos)
 
+
 def eh_ip_privado(ip):
     try:
-        if pd.isna(ip): 
+        if pd.isna(ip):
             return 0
         return 1 if ipaddress.ip_address(str(ip).strip()).is_private else 0
-    except:
-        return 0 # valor inválido
+    except ValueError:
+        return 0
 
-def extrair_features(caminho_arquivo, caminho_destino):
-    df = ler_entrada(caminho_arquivo)
 
-    # --- PASSO 2: Tratamento do Timestamp e IPs ---
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df['hour'] = df['timestamp'].dt.hour
-    df['day_of_week'] = df['timestamp'].dt.dayofweek
-    df['is_weekend'] = df['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
-    
-    # Extração de Metadados de IP (Antes de dropar as colunas de IP originais)
-    df['is_src_private'] = df['src_ip'].apply(eh_ip_privado)
-    df['is_dst_private'] = df['dst_ip'].apply(eh_ip_privado)
-    
-    # Simulação da lista de IPs bloqueados pelo firewall
-    # Adicione aqui dentro o IP real que usou nos testes para dar match (ex: '10.93.46.23')
-    ips_simulados_bloqueados = {'10.93.46.23', '192.168.1.50'} 
-    df['src_ip_blocked'] = df['src_ip'].isin(ips_simulados_bloqueados).astype(int)
+def preparar_dados(df):
+    """Converte o evento unificado em colunas tipadas para o pré-processador."""
+    df = df.copy()
+    for campo in ["timestamp", "src_ip", "dst_ip", *CAMPOS_CATEGORICOS,
+                  "severity", "src_port", "dst_port", "pkts_to_server",
+                  "pkts_to_client", "bytes_to_server", "bytes_to_client",
+                  "duration_s"]:
+        if campo not in df:
+            df[campo] = pd.NA
 
-    # Passando todas as colunas de texto livre de uma vez só e salvando de volta no df
-    df = df.drop(columns=[
-        'timestamp', 'signature', 'signature_id', 'username', 'password', 'category',
-        'payload', 'session_id', 'src_log', 'agent_name', 'extra', 'src_ip', 'dst_ip'
-    ], errors='ignore')
+    timestamp = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["hour"] = timestamp.dt.hour
+    df["day_of_week"] = timestamp.dt.day_of_week
+    df["is_weekend"] = timestamp.dt.day_of_week.ge(5).fillna(False).astype(int)
+    df["is_src_private"] = df["src_ip"].apply(eh_ip_privado)
+    df["is_dst_private"] = df["dst_ip"].apply(eh_ip_privado)
+    ips_simulados_bloqueados = {"10.93.46.23", "192.168.1.50"}
+    df["src_ip_blocked"] = df["src_ip"].isin(ips_simulados_bloqueados).astype(int)
 
-    # --- PASSO 3: Tratamento de Variáveis Categóricas (One-Hot Encoding) ---
-    df_encoded = pd.get_dummies(df, columns=CAMPOS_CATEGORICOS, dtype=int)
+    df["severity"] = (
+        df["severity"].astype("string").str.lower().map(MAPA_SEVERIDADE)
+    )
+    for campo in CAMPOS_CATEGORICOS:
+        df[campo] = df[campo].fillna("(ausente)").astype(str)
+    for campo in CAMPOS_NUMERICOS:
+        df[campo] = pd.to_numeric(df[campo], errors="coerce").fillna(0)
+    df["severity"] /= 4
+    df["src_port"] /= 65535
+    df["dst_port"] /= 65535
+    df["hour"] /= 23
+    df["day_of_week"] /= 6
 
-    # --- PASSO 4: Tratamento da Severidade Textual ---
-    df_encoded['severity'] = df_encoded['severity'].fillna('info')
-    df_encoded['severity'] = df_encoded['severity'].map(MAPA_SEVERIDADE)
-    # Se algum valor novo não mapeado surgir, vira 0 (info)
-    df_encoded['severity'] = df_encoded['severity'].fillna(0)
+    return df[CAMPOS_CATEGORICOS + CAMPOS_NUMERICOS]
 
-    # Preenchimento de nulos para pacotes/bytes e duração
-    for campo in CAMPOS_ESCALONADOS:
-        df_encoded[campo] = df_encoded[campo].fillna(0)
 
-    # --- PASSO 5: Normalização Matemática Fixa (Sem vazamento de dados!) ---
-    df_encoded['src_port'] = df_encoded['src_port'].fillna(0) / 65535.0
-    df_encoded['dst_port'] = df_encoded['dst_port'].fillna(0) / 65535.0
-    df_encoded['hour'] = df_encoded['hour'] / 23.0
-    df_encoded['day_of_week'] = df_encoded['day_of_week'] / 6.0
-    df_encoded['severity'] = df_encoded['severity'] / 4.0  # Dividido por 4 (já que mapeamos de 0 a 4)
+def criar_preprocessador():
+    return ColumnTransformer(
+        transformers=[
+            (
+                "categoricas",
+                OneHotEncoder(handle_unknown="ignore", dtype=int),
+                CAMPOS_CATEGORICOS,
+            ),
+            ("escalonadas", MinMaxScaler(), CAMPOS_ESCALONADOS),
+            (
+                "numericas_fixas",
+                "passthrough",
+                [campo for campo in CAMPOS_NUMERICOS if campo not in CAMPOS_ESCALONADOS],
+            ),
+        ],
+        verbose_feature_names_out=False,
+    )
 
-    # Para os campos dinâmicos (bytes e pacotes), mantemos o scaler padrão do sklearn
-    scaler = MinMaxScaler()
-    df_encoded[CAMPOS_ESCALONADOS] = scaler.fit_transform(df_encoded[CAMPOS_ESCALONADOS])
 
-    # --- PASSO 6: Gerando os Vetores de Características ---
-    vetores_caracteristicas = df_encoded.to_numpy()
+def extrair_features(caminho_arquivo, caminho_destino, caminho_preprocessador,
+                     ajustar):
+    dados = preparar_dados(ler_entrada(caminho_arquivo))
+    if ajustar:
+        preprocessador = criar_preprocessador()
+        transformados = preprocessador.fit_transform(dados)
+        caminho_preprocessador.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(preprocessador, caminho_preprocessador)
+    else:
+        preprocessador = joblib.load(caminho_preprocessador)
+        transformados = preprocessador.transform(dados)
 
-    print("=== DataFrame Estruturado (Pronto para IA) ===")
-    print(df_encoded)
+    nomes_colunas = preprocessador.get_feature_names_out()
+    df_encoded = pd.DataFrame(
+        transformados.toarray() if hasattr(transformados, "toarray") else transformados,
+        columns=nomes_colunas,
+        index=dados.index,
+    )
 
     caminho_destino.parent.mkdir(parents=True, exist_ok=True)
     if caminho_destino.suffix.lower() == ".csv":
@@ -134,13 +141,35 @@ def extrair_features(caminho_arquivo, caminho_destino):
     else:
         raise ValueError("Extensão de saída deve ser .csv, .jsonl ou .json")
 
+    print(f"Vetor de características gerado: {caminho_destino}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Extrai características dos logs unificados.")
     parser.add_argument("-i", "--input", required=True, help="arquivo CSV ou JSONL de entrada")
     parser.add_argument("-o", "--output", required=True, help="arquivo .csv, .jsonl ou .json de saída")
+    modo = parser.add_mutually_exclusive_group(required=True)
+    modo.add_argument(
+        "--fit-preprocessor",
+        type=Path,
+        metavar="ARQUIVO",
+        help="ajusta o pré-processador com os dados de treino e salva em ARQUIVO",
+    )
+    modo.add_argument(
+        "--preprocessor",
+        type=Path,
+        metavar="ARQUIVO",
+        help="carrega o pré-processador ajustado para transformar os dados",
+    )
     args = parser.parse_args()
-    extrair_features(Path(args.input), Path(args.output))
+    ajustar = args.fit_preprocessor is not None
+    caminho_preprocessador = args.fit_preprocessor or args.preprocessor
+    extrair_features(
+        Path(args.input),
+        Path(args.output),
+        caminho_preprocessador,
+        ajustar,
+    )
 
 
 if __name__ == "__main__":
